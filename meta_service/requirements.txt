@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pandas
+numpy
+scikit-learn
+xgboost
+mlflow
+pydantic
+boto3
+firebase-admin
+google-cloud-firestore
+google-cloud-storage
+google-cloud-pubsub

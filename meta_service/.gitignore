@@ -1,0 +1,17 @@
+# Secrets and Keys
+creds-2.json
+*.json
+.env
+secret.key
+deploy_simple.ps1
+deploy_simple.sh
+
+# Python junk
+__pycache__/
+*.pyc
+venv/
+.pytest_cache/
+
+# System junk
+.DS_Store
+
