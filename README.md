@@ -158,4 +158,4 @@ A continuación se detalla el significado de cada campo retornado en el objeto J
 
 Los resultados se encuentran registrados en una tabla de BigQuery: `quipumarket-c956f.Data.decisiones_debito_automatico`. 
 
-En la columna `data`
+En la columna `data`se encuentra el diccionario con la respuesta del API.
