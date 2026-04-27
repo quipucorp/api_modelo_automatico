@@ -40,7 +40,7 @@ def log_msg(message, prop=None):
 
 # MLFLOW CONFIG
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI")
-MLFLOW_USERNAME = os.getenv("MLFLOW_TRACKING_USERNAME", "fmoreno")
+MLFLOW_USERNAME = os.getenv("MLFLOW_TRACKING_USERNAME", "mmoreno")
 MLFLOW_PASSWORD = os.getenv("MLFLOW_TRACKING_PASSWORD", "password_test")
 PRODUCTION_RUN_ID = "322928467e9249c1a9a9d221016b6ff7" 
 MODEL_ARTIFACT_PATH = "debito_automatico"
