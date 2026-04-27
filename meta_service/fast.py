@@ -6,6 +6,9 @@ import mlflow.sklearn
 import firebase_admin
 import logging
 import json
+import re
+import warnings
+from collections import Counter
 from firebase_admin import credentials, firestore
 from fastapi import FastAPI, HTTPException, Request
 from boto3.dynamodb.conditions import Key, Attr
@@ -20,6 +23,7 @@ from google.cloud import pubsub_v1
 # ==========================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("DebitoAutomatico")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ==========================================
 # 1. CONFIGURATION
@@ -59,8 +63,7 @@ PUBSUB_TOPIC_NAME = 'projects/quipumarket-c956f/topics/modelo_ai_debito_automati
 async def lifespan(app: FastAPI):
     logger.info("🚀 Starting Up: Initializing Clients & Loading Model...")
     
-    # --- 1. SETUP AUTH (CRÍTICO: Cargar esto PRIMERO) ---
-    # Esto configura la variable de entorno ANTES de que cualquier cliente de Google intente usarse
+    # --- 1. SETUP AUTH ---
     if os.path.exists("./creds-2.json"):
         os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = "./creds-2.json"
         logger.info("🔑 Google Credentials loaded from file")
@@ -70,9 +73,7 @@ async def lifespan(app: FastAPI):
     # --- 2. SETUP MLFLOW ---
     if not MLFLOW_TRACKING_URI:
         logger.error("❌ CRITICAL: MLFLOW_TRACKING_URI env var is missing!")
-        # No lanzamos error aquí para permitir depuración local, pero es grave
     
-    # Configuramos MLflow
     os.environ['MLFLOW_TRACKING_USERNAME'] = MLFLOW_USERNAME
     os.environ['MLFLOW_TRACKING_PASSWORD'] = MLFLOW_PASSWORD
     if MLFLOW_TRACKING_URI:
@@ -87,14 +88,12 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Model loaded successfully!")
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
-        # En producción esto debería detener el app, pero para test local lo dejamos pasar
         app.state.model = None
 
     # --- 4. INIT DATABASES ---
     initialize_databases(app)
 
-    # --- 5. INIT PUBSUB (CORREGIDO: Ahora se inicia DENTRO de lifespan) ---
-    # Al estar aquí, ya 've' la variable GOOGLE_APPLICATION_CREDENTIALS seteada arriba
+    # --- 5. INIT PUBSUB ---
     try:
         app.state.publisher = pubsub_v1.PublisherClient()
         logger.info("📡 Pub/Sub Client Initialized")
@@ -148,14 +147,198 @@ def publish_df_to_pubsub(data, publisher):
         log_msg(f"❌ Error publishing to Pub/Sub: {e}")
 
 # ==========================================
-# 4. APP DEFINITION
+# 4. TRANSACCIONALIDAD SMS v5 LOGIC
 # ==========================================
-# IMPORTANTE: Aquí NO definimos app.publisher = ...
-# Eso causaba el error. Lo hacemos dentro de lifespan.
+# Logic integrated for finding "cuenta_mayor_volumen"
+# ==========================================
+
+_AMOUNT_PATTERNS = [
+    r"\$\s*([\d]{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)",
+    r"\$\s*(\d{4,8}(?:\.\d{1,2})?)",
+    r"([\d]{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)\s*(?:COP|cop|pesos?)",
+    r"(?:COP|cop)\s*([\d]{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)",
+    r"(?:valor|monto|total|saldo|disponible)[:\s]*\$?\s*([\d]{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)",
+    r"([\d]+(?:[.,]\d+)?[Kk])\b",
+]
+
+_MONETARY_CONTEXT_PAT = re.compile(
+    r"(pago|compra|transfer|consign|retiro|dep[oó]sito|abono|saldo|"
+    r"recib|envi|d[eé]bito|cr[eé]dito|cuota|factura|disponible|"
+    r"n[oó]mina|salario)",
+    re.IGNORECASE,
+)
+_LOOSE_NUMBER_PAT = r"(?<!\d)(\d{5,8})(?!\d)"
+_NOT_AMOUNT_PATTERNS = [
+    r"(?:c[eé]dula|cc|documento|nit)\s*:?\s*\d",
+    r"(?:tel|cel|movil|whatsapp|llam)\s*:?\s*\d",
+    r"(?:ref|referencia|codigo|c[oó]digo|otp|clave|pin)\s*:?\s*\d",
+    r"\b3[0-9]{9}\b",
+    r"\b60[0-9]\s*\d{7}\b",
+]
+
+_BANK_PATTERNS = {
+    "bancolombia": r"\bbancolombia\b", "davivienda": r"\bdavivienda\b", "bbva": r"\bbbva\b",
+    "banco_de_bogota": r"\bbanco\s+de\s+bogot[aá]\b|\bbdeb\b", "banco_popular": r"\bbanco\s+popular\b",
+    "av_villas": r"\bav\s*villas\b", "scotiabank_colpatria": r"\bscotiabank\b|\bcolpatria\b",
+    "caja_social": r"\bcaja\s+social\b", "itau": r"\bita[uú]\b", "gnb_sudameris": r"\bgnb\b|\bsudameris\b",
+    "nequi": r"\bnequi\b", "daviplata": r"\bdaviplata\b", "movii": r"\bmovii\b", "dale": r"\bdale!\b|\bdale\s+app\b",
+    "tpaga": r"\btpaga\b", "powwi": r"\bpowwi\b", "nubank": r"\bnubank\b|\bnu\s+colombia\b",
+    "rappipay": r"\brappipay\b|\brappi\s*pay\b", "lulo_bank": r"\blulo\s*bank\b", "uala": r"\buala\b|\bual[aá]\b",
+    "pibank": r"\bpibank\b", "ban100": r"\bban100\b|\bbancien\b", "banco_agrario": r"\bagrario\b|\bbanco\s+agrario\b",
+    "banco_w": r"\bbanco\s+w\b", "coink": r"\bcoink\b", "Nubank": r"\bNubank\b", "Littio": r"\bLittio\b", "bold": r"\bbold\s+co\b|\bbold\.co\b",
+}
+
+_OWNER_CONTEXT = r"(desde\s+tu|de\s+tu|tu\s+cuenta|cuenta\s+no\.?|terminada?\s+en|finaliza?\s+en|tarjeta\s+|ahorro\s+|corriente\s+)"
+_RECIPIENT_CONTEXT = r"(a\s+la\s+cuenta|cuenta\s+destino|inscrita|abono\s+a|enviado\s+a|transferido\s+a)"
+
+_SALDO_PAT = re.compile(r"(saldo\s+(disponible|actual|total)|consulta\s+de\s+saldo|su\s+saldo)", re.IGNORECASE)
+_FAILED_TX_PAT = re.compile(r"(fondos\s+insuficientes|saldo\s+insuficiente|no\s+exitos[ao]|rechazad[ao]|declinad[ao]|fallid[ao]|error\s+en\s+transacci[oó]n|intente\s+nuevamente|transacci[oó]n\s+no\s+autorizada|clave\s+inv[aá]lida)", re.IGNORECASE)
+_PROMO_PAT = re.compile(r"(pr[eé]stamo\s*(pre.?aprobado|propulsor)|solicita?|pre.?aprobado|cup[oó]n|gana|descarga|luckyplata|rapicredit|mora|cobranza|deuda|incumplimiento)", re.IGNORECASE)
+_INGRESO_PAT = re.compile(r"(recibiste|te\s+enviar?on|pago\s+recibido|abono|dep[oó]sito|consignaci[oó]n|transferencia\s+recibida|ingreso|cr[eé]dito\s+a\s+tu|n[oó]mina|salario|devoluci[oó]n)", re.IGNORECASE)
+_GASTO_PAT = re.compile(r"(pagaste|compra|pago\s+(exitoso|realizado)|d[eé]bito|cargo|retiro|enviaste|transferencia\s+enviada|transferiste|cajero|pos\b|establecimiento|factura|suscripci[oó]n|cuota)", re.IGNORECASE)
+
+def _parse_amount_str(raw: str) -> float:
+    try:
+        text = str(raw).strip().replace(" ", "")
+        text = re.sub(r"(?i)(cop|pesos?)", "", text).replace("$", "")
+        k_mult = 1000 if re.search(r"[Kk]$", text) else 1
+        text = re.sub(r"[Kk]$", "", text)
+        if "." in text and "," in text:
+            if text.rfind(".") > text.rfind(","): text = text.replace(",", "")
+            else: text = text.replace(".", "").replace(",", ".")
+        elif "," in text:
+            text = text.replace(",", ".") if len(text.split(",")[1]) <= 2 else text.replace(",", "")
+        elif "." in text:
+            text = text.replace(".", "") if len(text.split(".")) > 2 or (len(text.split(".")[1]) == 3) else text
+        return float(text) * k_mult
+    except: return np.nan
+
+def _is_likely_not_amount(text, match_start, match_end):
+    context_before = text[max(0, match_start - 30):match_start].lower()
+    for pat in _NOT_AMOUNT_PATTERNS:
+        if re.search(pat, context_before, re.IGNORECASE): return True
+    return True if re.match(r"^3\d{9}$", text[match_start:match_end]) else False
+
+def _extract_amounts(text, min_cop=500, max_cop=5e7):
+    if not isinstance(text, str): return []
+    values = []
+    for pat in _AMOUNT_PATTERNS:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            if not _is_likely_not_amount(text, m.start(), m.end()):
+                val = _parse_amount_str(m.group(1))
+                if pd.notnull(val) and min_cop <= val <= max_cop: values.append(val)
+    if _MONETARY_CONTEXT_PAT.search(text) and not values:
+        for m in re.finditer(_LOOSE_NUMBER_PAT, text):
+            if not _is_likely_not_amount(text, m.start(), m.end()):
+                val = _parse_amount_str(m.group(1))
+                if pd.notnull(val) and min_cop <= val <= max_cop: values.append(val)
+    return list(set(values))
+
+def _pick_main_amount(amounts):
+    return float(np.median(amounts)) if amounts else np.nan
+
+def _detect_bank(text):
+    if not isinstance(text, str): return None
+    for bank, pat in _BANK_PATTERNS.items():
+        if re.search(pat, text.lower()): return bank
+    return None
+
+def _extract_user_accounts_with_evidence(text):
+    if not isinstance(text, str): return {}
+    t = text.lower()
+    found_accounts = {}
+    blacklist = ['2024', '2025', '2026']
+    for match in re.finditer(r"\b(\d{4})\b", t):
+        cta = match.group(1)
+        if cta in blacklist: continue
+        start_pos = match.start()
+        context_window = t[max(0, start_pos - 35):start_pos]
+        is_owner = re.search(_OWNER_CONTEXT, context_window)
+        is_recipient = re.search(_RECIPIENT_CONTEXT, context_window)
+        is_asterisco = "*" in t[max(0, start_pos - 2):start_pos]
+        if is_asterisco or (is_owner and not is_recipient):
+            if cta not in found_accounts: found_accounts[cta] = text.strip()
+    return found_accounts
+
+def _classify_tipo(text):
+    if not isinstance(text, str): return None
+    if _FAILED_TX_PAT.search(text): return "fallida"
+    if _PROMO_PAT.search(text): return "promo"
+    if _SALDO_PAT.search(text): return "saldo"
+    if _INGRESO_PAT.search(text): return "ingreso"
+    if _GASTO_PAT.search(text): return "gasto"
+    return None
+
+def _clean_date(date_str):
+    s = str(date_str)
+    s = re.sub(r"\s*(?:EDT|EST|CST|PST|COT|GMT[+-]?\d{0,2}(?::\d{2})?)\s*", " ", s)
+    return s.strip()
+
+def _find_date_col(df):
+    candidates = ["date", "createdAt", "created_at", "timestamp", "sentAt", "receivedAt", "fecha", "sent_at", "received_at"]
+    for c in candidates:
+        if c in df.columns: return c
+    raise KeyError("No date column found")
+
+# --- MAIN V5 FUNCTION ---
+def analizar_transaccionalidad_sms_v5(baseline: pd.DataFrame, id_col: str = "userId_linked", body_col: str = "body", date_col: str = None):
+    try:
+        if date_col is None: date_col = _find_date_col(baseline)
+        work = baseline[[id_col, body_col, date_col]].copy()
+        
+        def _parse_date(val):
+            if pd.isna(val): return pd.NaT
+            try:
+                num = float(val)
+                if num > 1e12: return pd.Timestamp(num, unit='ms')
+                elif num > 1e9: return pd.Timestamp(num, unit='s')
+            except: pass
+            return pd.to_datetime(_clean_date(val), errors='coerce')
+
+        work["date_parsed"] = work[date_col].apply(_parse_date)
+        work["bank"] = work[body_col].apply(_detect_bank)
+        work["tipo"] = work[body_col].apply(_classify_tipo)
+        work["acc_evidence_map"] = work[body_col].apply(_extract_user_accounts_with_evidence)
+        work["account_numbers"] = work["acc_evidence_map"].apply(lambda d: list(d.keys()))
+        work["amounts"] = work[body_col].apply(lambda t: _extract_amounts(t))
+        work["monto_sms"] = work["amounts"].apply(_pick_main_amount)
+
+        valid_montos = work.loc[work["bank"].notna(), "monto_sms"].dropna()
+        if len(valid_montos) > 0:
+            cap_val = np.percentile(valid_montos, 99)
+            work["monto_sms"] = work["monto_sms"].clip(upper=cap_val)
+
+        tx = work.dropna(subset=["bank", "monto_sms", "date_parsed"]).copy()
+        tx = tx[~tx["tipo"].isin(["promo", "fallida"])].copy()
+        
+        if len(tx) == 0: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+        # Find Highest Volume Account
+        def _find_highest_volume_account(df_tx):
+            exploded = df_tx.explode("account_numbers")
+            valid = exploded.dropna(subset=["account_numbers", "monto_sms"])
+            if valid.empty: return {}
+            vol_por_cuenta = valid.groupby(["bank", "account_numbers"])["monto_sms"].sum().reset_index()
+            if vol_por_cuenta.empty: return {}
+            top = vol_por_cuenta.loc[vol_por_cuenta["monto_sms"].idxmax()]
+            return {top["bank"]: top["account_numbers"]}
+
+        cuentas_lideres = tx.groupby(id_col).apply(_find_highest_volume_account).reset_index(name="cuenta_mayor_volumen")
+        
+        # Stub dfs for other returns not used here
+        return pd.DataFrame(), pd.DataFrame(), cuentas_lideres
+        
+    except Exception as e:
+        logger.error(f"Error in V5 analysis: {e}")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+# ==========================================
+# 5. APP DEFINITION
+# ==========================================
 app = FastAPI(title="Debito Automatico Meta-Service", lifespan=lifespan)
 
 # ==========================================
-# 5. CONSTANTS & FEATURES
+# 6. CONSTANTS & FEATURES
 # ==========================================
 BASE_FEATURES_LIST = [
     'tarjetas_credito_count', 'zona_premium_count', 'engagement_score', 
@@ -186,7 +369,7 @@ SELECTED_FEATURES = [
 ]
 
 # ==========================================
-# 6. SERVICE CLASSES
+# 7. SERVICE CLASSES
 # ==========================================
 class DeviceUserService:
     def __init__(self, dynamodb_resource):
@@ -231,7 +414,7 @@ class SMSService:
         return all_sms
 
 # ==========================================
-# 7. FEATURE EXTRACTION (LOGIC)
+# 8. FEATURE EXTRACTION (LOGIC)
 # ==========================================
 class SMSVariableExtractor:
     def __init__(self, sms_data, user_id):
@@ -410,7 +593,7 @@ def mensajes(sms_logs: List[Dict], user_id: str) -> pd.DataFrame:
     return pd.DataFrame([variables])
 
 # ==========================================
-# 8. FEATURE EXPANSION & SELECTION
+# 9. FEATURE EXPANSION & SELECTION
 # ==========================================
 def feature_expansion(df_base: pd.DataFrame) -> pd.DataFrame:
     df_processed = df_base.copy()
@@ -439,7 +622,7 @@ def feature_selection(df_expanded: pd.DataFrame) -> pd.DataFrame:
     return df_final[SELECTED_FEATURES]
 
 # ==========================================
-# 9. ENDPOINTS
+# 10. ENDPOINTS
 # ==========================================
 
 def get_firestore_metadata(credit_id: str, db) -> Dict[str, Any]:
@@ -480,7 +663,7 @@ def run_debito_check(uid: str, request: Request):
         # 3. SMS
         sms_logs = sms_service.get_sms_by_uuid_devices(uuid_devices)
 
-        # 4. Extract (Michael)
+        # 4. Extract ML Features
         df_base = mensajes(sms_logs, user_id)
         
         # 5. Expand (Ratios)
@@ -498,6 +681,35 @@ def run_debito_check(uid: str, request: Request):
         THRESHOLD = 0.5090
         decision = "aprobado" if score < THRESHOLD else "rechazado"
 
+        # 8. [NEW] Run V5 Logic for Highest Volume Account
+        cuenta_mayor_data = {}
+        try:
+            if sms_logs:
+                df_v5 = pd.DataFrame(sms_logs)
+                # Map columns if necessary
+                if 'body' not in df_v5.columns:
+                    df_v5['body'] = df_v5.get('content', df_v5.get('message', ''))
+                
+                # Add userId link
+                df_v5['userId_linked'] = user_id
+                
+                _, _, df_alter = analizar_transaccionalidad_sms_v5(df_v5, id_col='userId_linked')
+                
+                if not df_alter.empty and 'cuenta_mayor_volumen' in df_alter.columns:
+                    val = df_alter['cuenta_mayor_volumen'].iloc[0]
+                    # Clean weird types
+                    if isinstance(val, (set, list, tuple)):
+                         cuenta_mayor_data = list(val)
+                    elif isinstance(val, dict):
+                         cuenta_mayor_data = val
+                    elif pd.isna(val):
+                         cuenta_mayor_data = {}
+                    else:
+                         cuenta_mayor_data = val
+        except Exception as e:
+            logger.error(f"Failed to extract cuenta_mayor: {e}")
+            cuenta_mayor_data = {}
+
         result = {
             "credit_uid": uid,
             "user_id": user_id,
@@ -506,11 +718,11 @@ def run_debito_check(uid: str, request: Request):
             "fraud_probability": score,
             "decision": decision,
             "threshold": THRESHOLD,
-            "features_used": df_final.to_dict(orient='records')[0]
+            "features_used": df_final.to_dict(orient='records')[0],
+            "cuenta_mayor": cuenta_mayor_data  # <--- NEW KEY
         }
 
-        # 8. PUBLISH TO PUBSUB (Safe Call)
-        # Recuperamos el publisher del ESTADO, no de app.publisher
+        # 9. PUBLISH TO PUBSUB
         publisher = request.app.state.publisher
         if publisher:
             log_msg(f"Publishing result to PubSub...")
@@ -527,7 +739,6 @@ def run_debito_check(uid: str, request: Request):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
